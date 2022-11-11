@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/bxcodec/httpcache/cache"
-	cacheControl "github.com/bxcodec/httpcache/helper/cacheheader"
 )
 
 // Headers
@@ -28,6 +27,7 @@ type CacheHandler struct {
 	DefaultRoundTripper http.RoundTripper
 	CacheInteractor     cache.ICacheInteractor
 	ComplyRFC           bool
+	cacheValidator      Validator
 }
 
 // NewCacheHandlerRoundtrip will create an implementations of cache http roundtripper
@@ -39,64 +39,18 @@ func NewCacheHandlerRoundtrip(defaultRoundTripper http.RoundTripper, rfcComplian
 		DefaultRoundTripper: defaultRoundTripper,
 		CacheInteractor:     cacheActor,
 		ComplyRFC:           rfcCompliance,
+		cacheValidator:      NewDefaultValidator(),
 	}
 }
 
-func validateTheCacheControl(req *http.Request, resp *http.Response) (validationResult cacheControl.ObjectResults, err error) {
-	reqDir, err := cacheControl.ParseRequestCacheControl(req.Header.Get("Cache-Control"))
-	if err != nil {
-		return
-	}
-
-	resDir, err := cacheControl.ParseResponseCacheControl(resp.Header.Get("Cache-Control"))
-	if err != nil {
-		return
-	}
-
-	expiry := resp.Header.Get("Expires")
-	expiresHeader, err := http.ParseTime(expiry)
-	if err != nil && expiry != "" &&
-		// https://stackoverflow.com/questions/11357430/http-expires-header-values-0-and-1
-		expiry != "-1" && expiry != "0" {
-		return
-	}
-
-	dateHeaderStr := resp.Header.Get("Date")
-	dateHeader, err := http.ParseTime(dateHeaderStr)
-	if err != nil && dateHeaderStr != "" {
-		return
-	}
-
-	lastModifiedStr := resp.Header.Get("Last-Modified")
-	lastModifiedHeader, err := http.ParseTime(lastModifiedStr)
-	if err != nil && lastModifiedStr != "" {
-		return
-	}
-
-	obj := cacheControl.Object{
-		RespDirectives:         resDir,
-		RespHeaders:            resp.Header,
-		RespStatusCode:         resp.StatusCode,
-		RespExpiresHeader:      expiresHeader,
-		RespDateHeader:         dateHeader,
-		RespLastModifiedHeader: lastModifiedHeader,
-		ReqDirectives:          reqDir,
-		ReqHeaders:             req.Header,
-		ReqMethod:              req.Method,
-		NowUTC:                 time.Now().UTC(),
-	}
-
-	validationResult = cacheControl.ObjectResults{}
-	cacheControl.CachableObject(&obj, &validationResult)
-	cacheControl.ExpirationObject(&obj, &validationResult)
-
-	return validationResult, nil
+func (c *CacheHandler) SetCustomValidator(v Validator) {
+	c.cacheValidator = v
 }
 
-func (r *CacheHandler) roundTripRFCCompliance(req *http.Request) (resp *http.Response, err error) {
+func (r *CacheHandler) roundTripRFCCompliance(validator Validator, req *http.Request) (resp *http.Response, err error) {
 	allowCache := allowedFromCache(req.Header)
 	if allowCache {
-		cachedResp, cachedItem, cachedErr := getCachedResponse(r.CacheInteractor, req)
+		cachedResp, cachedItem, cachedErr := getCachedResponse(nil, r.CacheInteractor, req)
 		if cachedResp != nil && cachedErr == nil {
 			buildTheCachedResponseHeader(cachedResp, cachedItem, r.CacheInteractor.Origin())
 			return cachedResp, cachedErr
@@ -112,7 +66,7 @@ func (r *CacheHandler) roundTripRFCCompliance(req *http.Request) (resp *http.Res
 		return
 	}
 
-	validationResult, errValidation := validateTheCacheControl(req, resp)
+	validationResult, errValidation := validator.ValidateCacheControl(req, resp)
 	if errValidation != nil {
 		log.Printf("Can't validate the response to RFC 7234, plase check. Err: %v\n", errValidation)
 		return // return directly, not sure can be stored or not
@@ -141,9 +95,9 @@ func (r *CacheHandler) roundTripRFCCompliance(req *http.Request) (resp *http.Res
 // RoundTrip the implementation of http.RoundTripper
 func (r *CacheHandler) RoundTrip(req *http.Request) (resp *http.Response, err error) {
 	if r.ComplyRFC {
-		return r.roundTripRFCCompliance(req)
+		return r.roundTripRFCCompliance(r.cacheValidator, req)
 	}
-	cachedResp, cachedItem, cachedErr := getCachedResponse(r.CacheInteractor, req)
+	cachedResp, cachedItem, cachedErr := getCachedResponse(r.cacheValidator, r.CacheInteractor, req)
 	if cachedResp != nil && cachedErr == nil {
 		buildTheCachedResponseHeader(cachedResp, cachedItem, r.CacheInteractor.Origin())
 		return cachedResp, cachedErr
@@ -189,7 +143,7 @@ func storeRespToCache(cacheInteractor cache.ICacheInteractor, req *http.Request,
 	return
 }
 
-func getCachedResponse(cacheInteractor cache.ICacheInteractor, req *http.Request) (resp *http.Response, cachedResp cache.CachedResponse, err error) {
+func getCachedResponse(validator Validator, cacheInteractor cache.ICacheInteractor, req *http.Request) (resp *http.Response, cachedResp cache.CachedResponse, err error) {
 	cachedResp, err = cacheInteractor.Get(getCacheKey(req))
 	if err != nil {
 		return
@@ -201,7 +155,7 @@ func getCachedResponse(cacheInteractor cache.ICacheInteractor, req *http.Request
 		return
 	}
 
-	validationResult, err := validateTheCacheControl(req, resp)
+	validationResult, err := validator.ValidateCacheControl(req, resp)
 	if err != nil {
 		return
 	}
